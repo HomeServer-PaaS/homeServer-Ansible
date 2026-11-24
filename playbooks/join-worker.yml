@@ -1,0 +1,145 @@
+---
+- name: Join exactly one prepared worker to the existing cluster
+  hosts: onprem_workers
+  gather_facts: true
+  serial: 1
+  any_errors_fatal: true
+  become: true
+
+  pre_tasks:
+    - name: Require exactly one selected worker
+      ansible.builtin.assert:
+        that:
+          - ansible_play_hosts_all | length == 1
+        fail_msg: Use --limit with exactly one worker SSH alias.
+
+    - name: Require explicit Calico address confirmation
+      ansible.builtin.assert:
+        that:
+          - calico_node_addressing_verified | bool
+          - calico_expected_node_ip == kubernetes_node_ip
+          - kubernetes_node_ip in ansible_facts.all_ipv4_addresses
+        fail_msg: >-
+          Confirm that the existing Calico Operator selects
+          {{ calico_expected_node_ip }} for this worker, then set
+          calico_node_addressing_verified=true in host/group vars. This project
+          will not change the cluster's Calico configuration.
+
+    - name: Require explicit network path confirmation
+      ansible.builtin.assert:
+        that:
+          - control_plane_to_worker_10250_verified | bool
+          - node_to_node_vxlan_4789_verified | bool
+          - calico_typha_deployment_checked | bool
+          - not calico_typha_in_use | bool or calico_typha_5473_verified | bool
+        fail_msg: >-
+          Confirm Control Plane-to-Worker TCP 10250, node-to-node VXLAN UDP
+          4789, and TCP 5473 if Typha is deployed. This project does not
+          change firewall or network settings.
+
+    - name: Refuse an already joined or partially initialized worker
+      ansible.builtin.stat:
+        path: /etc/kubernetes/kubelet.conf
+      register: worker_kubelet_conf
+
+    - name: Stop if kubeadm state already exists
+      ansible.builtin.assert:
+        that:
+          - not worker_kubelet_conf.stat.exists
+        fail_msg: >-
+          /etc/kubernetes/kubelet.conf already exists. Verify the node manually;
+          no reset or automatic rejoin is performed.
+
+    - name: Recheck worker-to-API TCP access immediately before token creation
+      ansible.builtin.wait_for:
+        host: "{{ kubernetes_api_host }}"
+        port: "{{ kubernetes_api_port }}"
+        state: started
+        connect_timeout: 3
+        timeout: 5
+      changed_when: false
+
+    - name: Confirm containerd CRI socket is active
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/ctr
+          - --address
+          - /run/containerd/containerd.sock
+          - plugins
+          - ls
+      register: containerd_plugins
+      changed_when: false
+      failed_when: >-
+        containerd_plugins.rc != 0 or
+        'io.containerd.cri.v1.runtime' not in containerd_plugins.stdout
+
+    - name: Recheck the control-plane Kubernetes version
+      ansible.builtin.command:
+        argv: [kubectl, --kubeconfig, /etc/kubernetes/admin.conf, version, --output=json]
+      delegate_to: "{{ groups['control_plane'] | first }}"
+      become: true
+      register: join_control_plane_version
+      changed_when: false
+
+    - name: Refuse a version mismatch before creating a token
+      ansible.builtin.assert:
+        that:
+          - (join_control_plane_version.stdout | from_json).serverVersion.gitVersion == ('v' ~ kubernetes_version)
+        fail_msg: The Control Plane version no longer matches this Inventory.
+
+    - name: Recheck the API endpoint certificate SAN
+      ansible.builtin.command:
+        argv: [openssl, x509, -in, /etc/kubernetes/pki/apiserver.crt, -noout, -ext, subjectAltName]
+      delegate_to: "{{ groups['control_plane'] | first }}"
+      become: true
+      register: join_api_certificate_sans
+      changed_when: false
+
+    - name: Refuse an API endpoint absent from the certificate SANs
+      ansible.builtin.assert:
+        that:
+          - kubernetes_api_host in join_api_certificate_sans.stdout
+        fail_msg: The configured API address is not in the Control Plane certificate SANs.
+
+    - name: Create a 15-minute bootstrap token on the Control Plane
+      ansible.builtin.command:
+        argv:
+          - kubeadm
+          - token
+          - create
+          - --ttl
+          - "{{ bootstrap_token_ttl }}"
+      delegate_to: "{{ groups['control_plane'] | first }}"
+      become: true
+      register: short_lived_bootstrap_token
+      changed_when: true
+      no_log: true
+
+    - name: Calculate the Control Plane CA SPKI hash
+      ansible.builtin.shell: |
+        set -o pipefail
+        openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt -noout | openssl pkey -pubin -outform DER | sha256sum
+      args:
+        executable: /bin/bash
+      delegate_to: "{{ groups['control_plane'] | first }}"
+      become: true
+      register: control_plane_ca_hash
+      changed_when: false
+      no_log: true
+
+  tasks:
+    - name: Join the selected worker with the verified endpoint and CA pin
+      ansible.builtin.command:
+        argv:
+          - kubeadm
+          - join
+          - "{{ kubernetes_api_endpoint }}"
+          - --token
+          - "{{ short_lived_bootstrap_token.stdout }}"
+          - --discovery-token-ca-cert-hash
+          - "sha256:{{ control_plane_ca_hash.stdout.split()[0] }}"
+          - --cri-socket
+          - "{{ kubernetes_cri_socket }}"
+      register: worker_join_result
+      changed_when: true
+      no_log: true

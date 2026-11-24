@@ -1,0 +1,19 @@
+---
+- name: Prepare exactly one worker host
+  hosts: onprem_workers
+  gather_facts: true
+  serial: 1
+  any_errors_fatal: true
+  become: true
+
+  pre_tasks:
+    - name: Require exactly one selected worker
+      ansible.builtin.assert:
+        that:
+          - ansible_play_hosts_all | length == 1
+        fail_msg: Use --limit with exactly one worker SSH alias.
+
+  roles:
+    - common
+    - containerd
+    - kubernetes-worker

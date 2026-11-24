@@ -1,0 +1,36 @@
+# Real environment inventories stay local. Start from inventory/example/.
+/inventory/production/
+/inventory/local/
+
+# Ansible runtime state
+.ansible/
+collections/
+artifacts/
+*.retry
+*.log
+
+# Credentials, private keys, and cluster access files
+.vault-pass
+.vault-password
+*.vault-pass
+*.vault-password
+*.token
+*.kubeconfig
+admin.conf
+controller-manager.conf
+scheduler.conf
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+
+# Local environment and Python artifacts
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+__pycache__/
+*.py[cod]

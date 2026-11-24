@@ -1,0 +1,27 @@
+---
+# Documentation-only addresses from the TEST-NET ranges. Replace in your
+# private inventory; these addresses are not routable production endpoints.
+ansible_python_interpreter: /usr/bin/python3
+
+kubernetes_api_host: 192.0.2.10
+kubernetes_api_port: 6443
+kubernetes_api_endpoint: "{{ kubernetes_api_host }}:{{ kubernetes_api_port }}"
+kubernetes_version: "1.37.0"
+kubernetes_minor_version: "1.37"
+kubernetes_package_state: present
+kubernetes_package_version: "1.37.0-*"
+kubernetes_cri_socket: unix:///run/containerd/containerd.sock
+
+containerd_version: "2.3.6"
+containerd_release_base_url: https://github.com/containerd/containerd/releases/download
+containerd_archive_arch: amd64
+runc_version: "1.5.2"
+runc_release_base_url: https://github.com/opencontainers/runc/releases/download
+runc_binary_sha256_amd64: 599f6f94ff8c5057241eff0d54c3c74f95c34935b6457b33fe545defc61e9488
+
+worker_supported_distribution: Ubuntu
+worker_supported_release: noble
+worker_supported_major_version: "24"
+worker_minimum_memory_mb: 2000
+worker_minimum_root_disk_mb: 10240
+bootstrap_token_ttl: 15m

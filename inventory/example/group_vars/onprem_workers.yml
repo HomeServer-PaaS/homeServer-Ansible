@@ -1,0 +1,13 @@
+---
+# Replace the documentation-only value with the worker's stable node address.
+kubernetes_node_ip: 198.51.100.20
+kubernetes_node_name: worker-01
+
+# Keep these false until the paths and Calico address selection are verified.
+calico_node_addressing_verified: false
+calico_expected_node_ip: "{{ kubernetes_node_ip }}"
+control_plane_to_worker_10250_verified: false
+node_to_node_vxlan_4789_verified: false
+calico_typha_deployment_checked: false
+calico_typha_in_use: false
+calico_typha_5473_verified: false

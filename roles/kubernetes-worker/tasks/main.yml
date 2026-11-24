@@ -1,0 +1,89 @@
+---
+- name: Validate Kubernetes package and node variables
+  ansible.builtin.assert:
+    that:
+      - kubernetes_minor_version | length > 0
+      - kubernetes_package_version | length > 0
+      - kubernetes_node_name | length > 0
+      - kubernetes_node_ip | length > 0
+    fail_msg: >-
+      Set the Kubernetes version, Node name, and Node IP in Inventory before
+      preparing a worker.
+
+- name: Ensure apt prerequisites are installed
+  ansible.builtin.apt:
+    name:
+      - ca-certificates
+      - curl
+      - gpg
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Ensure apt keyrings directory exists
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Download the Kubernetes {{ kubernetes_minor_version }} repository key
+  ansible.builtin.get_url:
+    url: "https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_minor_version }}/deb/Release.key"
+    dest: /etc/apt/keyrings/kubernetes-apt-keyring.asc
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Configure the Kubernetes {{ kubernetes_minor_version }} apt repository
+  ansible.builtin.apt_repository:
+    repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.asc] https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_minor_version }}/deb/ /"
+    filename: kubernetes
+    state: present
+    update_cache: true
+
+- name: Install the exact kubeadm and kubelet patch version
+  ansible.builtin.apt:
+    name:
+      - "kubeadm={{ kubernetes_package_version }}"
+      - "kubelet={{ kubernetes_package_version }}"
+    state: present
+    update_cache: true
+
+- name: Confirm the installed kubelet patch matches the Control Plane
+  ansible.builtin.command:
+    argv: [kubelet, --version]
+  register: installed_kubelet_version
+  changed_when: false
+
+- name: Stop if the selected kubelet patch differs from the Control Plane
+  ansible.builtin.assert:
+    that:
+      - "('v' ~ kubernetes_version) in installed_kubelet_version.stdout"
+    fail_msg: >-
+      Installed kubelet version does not match the Control Plane version
+      {{ kubernetes_version }}. Do not join until the version is aligned.
+
+- name: Hold kubeadm and kubelet until an intentional cluster upgrade
+  ansible.builtin.dpkg_selections:
+    name: "{{ item }}"
+    selection: hold
+  loop:
+    - kubeadm
+    - kubelet
+
+- name: Configure the kubelet to advertise the selected Node IP
+  ansible.builtin.template:
+    src: kubelet-default.j2
+    dest: /etc/default/kubelet
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart kubelet
+
+- name: Enable kubelet before kubeadm join
+  ansible.builtin.systemd_service:
+    name: kubelet
+    enabled: true
+    state: started

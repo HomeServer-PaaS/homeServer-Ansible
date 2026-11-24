@@ -1,0 +1,114 @@
+---
+- name: Read-only verification of one selected worker
+  hosts: onprem_workers
+  gather_facts: false
+  serial: 1
+  any_errors_fatal: true
+
+  tasks:
+    - name: Require exactly one selected worker
+      ansible.builtin.assert:
+        that:
+          - ansible_play_hosts_all | length == 1
+        fail_msg: Use --limit with exactly one worker SSH alias.
+
+    - name: Read the worker Node object from the control plane
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig
+          - /etc/kubernetes/admin.conf
+          - get
+          - node
+          - "{{ kubernetes_node_name }}"
+          - --output=json
+      delegate_to: "{{ groups['control_plane'] | first }}"
+      become: true
+      register: worker_node_json
+      changed_when: false
+
+    - name: Confirm Node readiness, version, and InternalIP
+      ansible.builtin.assert:
+        that:
+          - (worker_node_json.stdout | from_json).metadata.name == kubernetes_node_name
+          - ((worker_node_json.stdout | from_json).status.conditions | selectattr('type', 'equalto', 'Ready') | map(attribute='status') | first) == 'True'
+          - ((worker_node_json.stdout | from_json).status.addresses | selectattr('type', 'equalto', 'InternalIP') | map(attribute='address') | first) == kubernetes_node_ip
+          - (worker_node_json.stdout | from_json).status.nodeInfo.kubeletVersion.startswith('v' ~ kubernetes_minor_version ~ '.')
+        fail_msg: The Node is missing, NotReady, or advertises an unexpected version/IP.
+
+    - name: Check the worker kubelet API is reachable from the control plane
+      ansible.builtin.wait_for:
+        host: "{{ kubernetes_node_ip }}"
+        port: 10250
+        state: started
+        connect_timeout: 3
+        timeout: 5
+      delegate_to: "{{ groups['control_plane'] | first }}"
+      changed_when: false
+
+    - name: Read worker Calico system pods
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig
+          - /etc/kubernetes/admin.conf
+          - get
+          - pods
+          - --namespace
+          - calico-system
+          - --field-selector
+          - "spec.nodeName={{ kubernetes_node_name }}"
+          - --output=json
+      delegate_to: "{{ groups['control_plane'] | first }}"
+      become: true
+      register: worker_calico_pods
+      changed_when: false
+
+    - name: Require the worker calico-node pod to be ready
+      ansible.builtin.assert:
+        that:
+          - "(worker_calico_pods.stdout | from_json).items | selectattr('metadata.labels.k8s-app', 'equalto', 'calico-node') | list | length == 1"
+          - "((worker_calico_pods.stdout | from_json).items | selectattr('metadata.labels.k8s-app', 'equalto', 'calico-node') | map(attribute='status.phase') | first) == 'Running'"
+          - "((worker_calico_pods.stdout | from_json).items | selectattr('metadata.labels.k8s-app', 'equalto', 'calico-node') | map(attribute='status.containerStatuses') | first | map(attribute='ready') | min)"
+        fail_msg: The worker calico-node pod is absent or not ready; inspect its events and selected Node address.
+
+    - name: Require the worker CSI node pod to be ready
+      ansible.builtin.assert:
+        that:
+          - "(worker_calico_pods.stdout | from_json).items | selectattr('metadata.labels.k8s-app', 'equalto', 'csi-node-driver') | list | length == 1"
+          - "((worker_calico_pods.stdout | from_json).items | selectattr('metadata.labels.k8s-app', 'equalto', 'csi-node-driver') | map(attribute='status.phase') | first) == 'Running'"
+          - "((worker_calico_pods.stdout | from_json).items | selectattr('metadata.labels.k8s-app', 'equalto', 'csi-node-driver') | map(attribute='status.containerStatuses') | first | map(attribute='ready') | min)"
+        fail_msg: The worker csi-node-driver pod is absent or not ready.
+
+    - name: Read worker kube-proxy pods
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig
+          - /etc/kubernetes/admin.conf
+          - get
+          - pods
+          - --namespace
+          - kube-system
+          - --field-selector
+          - "spec.nodeName={{ kubernetes_node_name }}"
+          - --output=json
+      delegate_to: "{{ groups['control_plane'] | first }}"
+      become: true
+      register: worker_kube_proxy_pods
+      changed_when: false
+
+    - name: Require the worker kube-proxy pod to be ready
+      ansible.builtin.assert:
+        that:
+          - "(worker_kube_proxy_pods.stdout | from_json).items | selectattr('metadata.labels.k8s-app', 'equalto', 'kube-proxy') | list | length == 1"
+          - "((worker_kube_proxy_pods.stdout | from_json).items | selectattr('metadata.labels.k8s-app', 'equalto', 'kube-proxy') | map(attribute='status.phase') | first) == 'Running'"
+          - "((worker_kube_proxy_pods.stdout | from_json).items | selectattr('metadata.labels.k8s-app', 'equalto', 'kube-proxy') | map(attribute='status.containerStatuses') | first | map(attribute='ready') | min)"
+        fail_msg: The worker kube-proxy pod is absent or not ready.
+
+    - name: Report successful read-only verification
+      ansible.builtin.debug:
+        msg: >-
+          {{ kubernetes_node_name }} is Ready, advertises
+          {{ kubernetes_node_ip }}, uses the expected Kubernetes minor version,
+          and has ready Calico, CSI node-driver, and kube-proxy pods.

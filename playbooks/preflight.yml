@@ -1,0 +1,145 @@
+---
+- name: Read-only readiness checks for one selected worker
+  hosts: onprem_workers
+  gather_facts: true
+  serial: 1
+  any_errors_fatal: true
+
+  tasks:
+    - name: Require exactly one selected worker
+      ansible.builtin.assert:
+        that:
+          - ansible_play_hosts_all | length == 1
+        fail_msg: Use --limit with one worker SSH alias for the first application.
+
+    - name: Check the worker operating system, architecture, memory, and root disk capacity
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.distribution == worker_supported_distribution
+          - ansible_facts.distribution_release == worker_supported_release
+          - ansible_facts.distribution_major_version == worker_supported_major_version
+          - ansible_facts.architecture == 'x86_64'
+          - ansible_facts.memtotal_mb | int >= worker_minimum_memory_mb | int
+          - (ansible_facts.mounts | selectattr('mount', 'equalto', '/') | map(attribute='size_available') | first | int // 1048576) >= worker_minimum_root_disk_mb | int
+        fail_msg: >-
+          Expected Ubuntu 24.04 x86_64 with at least {{ worker_minimum_memory_mb }} MiB
+          RAM and {{ worker_minimum_root_disk_mb }} MiB free on /.
+
+    - name: Confirm the expected host name and local Node address
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.hostname == kubernetes_node_name
+          - kubernetes_node_ip in ansible_facts.all_ipv4_addresses
+        fail_msg: >-
+          The host name or selected Node IP differs from Inventory. Confirm the
+          correct SSH alias and NIC address before proceeding.
+
+    - name: Check worker time synchronization
+      ansible.builtin.command:
+        argv: [timedatectl, show, --property=NTPSynchronized, --value]
+      register: worker_clock_sync
+      changed_when: false
+      failed_when: false
+
+    - name: Confirm sudo access without changing the worker
+      ansible.builtin.command:
+        argv: [id, -u]
+      become: true
+      register: worker_sudo_check
+      changed_when: false
+
+    - name: Require sudo to resolve to root
+      ansible.builtin.assert:
+        that:
+          - worker_sudo_check.stdout | trim == "0"
+        fail_msg: The selected SSH user cannot become root on the Worker.
+
+    - name: Check the worker swap state without changing it
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.swaptotal_mb | int == 0
+          - worker_clock_sync.stdout | trim == 'yes'
+        fail_msg: >-
+          Swap must be off and system time synchronized before kubeadm. This
+          project does not change either host policy automatically.
+
+    - name: Check whether the worker already has kubeadm state
+      ansible.builtin.stat:
+        path: /etc/kubernetes/kubelet.conf
+      register: worker_kubelet_conf
+
+    - name: Check whether a containerd executable already exists
+      ansible.builtin.command:
+        argv:
+          - sh
+          - -c
+          - command -v containerd
+      register: existing_containerd_binary
+      changed_when: false
+      failed_when: false
+
+    - name: Stop if the worker appears initialized or has an unmanaged runtime
+      ansible.builtin.assert:
+        that:
+          - not worker_kubelet_conf.stat.exists
+          - existing_containerd_binary.rc != 0
+        fail_msg: >-
+          Existing Kubernetes state or containerd was detected. Review it
+          manually; the automation will not reset or replace it.
+
+    - name: Check API TCP access from the worker to the selected endpoint
+      ansible.builtin.wait_for:
+        host: "{{ kubernetes_api_host }}"
+        port: "{{ kubernetes_api_port }}"
+        state: started
+        connect_timeout: 3
+        timeout: 5
+      register: worker_to_api_tcp
+      ignore_errors: true
+      changed_when: false
+
+    - name: Read the current API server version on the control plane
+      ansible.builtin.command:
+        argv: [kubectl, --kubeconfig, /etc/kubernetes/admin.conf, version, --output=json]
+      delegate_to: "{{ groups['control_plane'] | first }}"
+      become: true
+      register: control_plane_version
+      changed_when: false
+      run_once: true
+
+    - name: Confirm the API endpoint is listed in the API server certificate SANs
+      ansible.builtin.command:
+        argv:
+          - openssl
+          - x509
+          - -in
+          - /etc/kubernetes/pki/apiserver.crt
+          - -noout
+          - -ext
+          - subjectAltName
+      delegate_to: "{{ groups['control_plane'] | first }}"
+      become: true
+      register: api_certificate_sans
+      changed_when: false
+      run_once: true
+
+    - name: Report unresolved Calico address selection
+      ansible.builtin.debug:
+        msg: >-
+          Before join, inspect the Calico Operator address autodetection and
+          confirm that this worker will use {{ calico_expected_node_ip }}.
+          The project will not modify Calico settings.
+      when: not calico_node_addressing_verified | bool
+
+    - name: Summarize API route, certificate, and version checks
+      ansible.builtin.assert:
+        that:
+          - not (worker_to_api_tcp.failed | default(false))
+          - (control_plane_version.stdout | from_json).serverVersion.gitVersion == ('v' ~ kubernetes_version)
+          - kubernetes_api_host in api_certificate_sans.stdout
+        fail_msg: >-
+          One or more preflight gates failed. Check worker-to-API TCP 6443,
+          certificate SAN, and the Control Plane Kubernetes version before
+          continuing. Control Plane-to-worker 10250 and node-to-node Calico
+          paths still require separate confirmation.
+      run_once: true

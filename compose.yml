@@ -1,0 +1,27 @@
+services:
+  ansible:
+    build:
+      context: .
+    working_dir: /workspace
+    init: true
+    environment:
+      SSH_AUTH_SOCK: /ssh-agent
+      ANSIBLE_HOST_KEY_CHECKING: "True"
+      ANSIBLE_LOCAL_TEMP: /tmp/ansible/local
+    volumes:
+      - type: bind
+        source: .
+        target: /workspace
+        read_only: true
+      - type: bind
+        source: ${HOME:?HOME must be set}/.ssh/config
+        target: /tmp/ssh/config
+        read_only: true
+      - type: bind
+        source: ${HOME:?HOME must be set}/.ssh/known_hosts
+        target: /tmp/ssh/known_hosts
+        read_only: true
+      - type: bind
+        source: ${SSH_AUTH_SOCK:?Start ssh-agent and load the SSH key first}
+        target: /ssh-agent
+        read_only: true

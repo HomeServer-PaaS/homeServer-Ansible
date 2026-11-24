@@ -1,0 +1,73 @@
+---
+- name: Refuse unsupported worker operating systems
+  ansible.builtin.assert:
+    that:
+      - ansible_facts.distribution == worker_supported_distribution
+      - ansible_facts.distribution_release == worker_supported_release
+      - ansible_facts.distribution_major_version == worker_supported_major_version
+      - ansible_facts.architecture == "x86_64"
+      - kubernetes_node_ip in ansible_facts.all_ipv4_addresses
+    fail_msg: >-
+      This role supports Ubuntu 24.04 (noble) only. Detected
+      {{ ansible_facts.distribution }} {{ ansible_facts.distribution_version }}.
+
+- name: Refuse a host name that differs from the intended Kubernetes Node name
+  ansible.builtin.assert:
+    that:
+      - ansible_facts.hostname == kubernetes_node_name
+    fail_msg: >-
+      Hostname {{ ansible_facts.hostname }} does not match
+      kubernetes_node_name={{ kubernetes_node_name }}. Rename it deliberately
+      outside this project, then rerun preflight.
+
+- name: Refuse a worker with active swap
+  ansible.builtin.assert:
+    that:
+      - ansible_facts.swaptotal_mb | int == 0
+    fail_msg: >-
+      Swap is active. This project will not change swap policy automatically;
+      investigate and prepare the host before continuing.
+
+- name: Refuse an already joined or partially initialized worker
+  ansible.builtin.stat:
+    path: /etc/kubernetes/kubelet.conf
+  register: kubernetes_worker_kubelet_conf
+
+- name: Stop before overwriting existing kubeadm state
+  ansible.builtin.assert:
+    that:
+      - not kubernetes_worker_kubelet_conf.stat.exists
+    fail_msg: >-
+      /etc/kubernetes/kubelet.conf already exists. Inspect the host manually;
+      this project does not reset or rejoin nodes.
+
+- name: Install persistent Kubernetes kernel module configuration
+  ansible.builtin.copy:
+    dest: /etc/modules-load.d/kubernetes.conf
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      overlay
+      br_netfilter
+
+- name: Load required kernel modules
+  ansible.builtin.modprobe:
+    name: "{{ item }}"
+    state: present
+  loop:
+    - overlay
+    - br_netfilter
+
+- name: Configure Kubernetes bridge and forwarding sysctls
+  ansible.posix.sysctl:
+    name: "{{ item.name }}"
+    value: "{{ item.value }}"
+    sysctl_file: /etc/sysctl.d/99-kubernetes-cri.conf
+    sysctl_set: true
+    state: present
+    reload: true
+  loop:
+    - { name: net.bridge.bridge-nf-call-iptables, value: "1" }
+    - { name: net.bridge.bridge-nf-call-ip6tables, value: "1" }
+    - { name: net.ipv4.ip_forward, value: "1" }

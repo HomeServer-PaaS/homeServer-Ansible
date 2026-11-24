@@ -1,0 +1,176 @@
+---
+- name: Read installed package facts
+  ansible.builtin.package_facts:
+    manager: auto
+
+- name: Refuse existing containerd packages
+  ansible.builtin.assert:
+    that:
+      - "'containerd' not in ansible_facts.packages"
+      - "'containerd.io' not in ansible_facts.packages"
+    fail_msg: >-
+      A containerd package is already installed. Inspect its origin and
+      configuration before choosing a migration; this role does not replace it.
+
+- name: Refuse an existing containerd binary in the managed locations
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop:
+    - /usr/bin/containerd
+    - /usr/local/bin/containerd
+  register: existing_containerd_paths
+
+- name: Stop if an unmanaged containerd binary exists
+  ansible.builtin.assert:
+    that:
+      - not item.stat.exists
+    fail_msg: >-
+      {{ item.stat.path }} already exists. Inspect the runtime installation
+      manually before preparing this Worker.
+  loop: "{{ existing_containerd_paths.results }}"
+
+- name: Check for an existing containerd configuration
+  ansible.builtin.stat:
+    path: /etc/containerd/config.toml
+  register: containerd_config_file
+
+- name: Read the existing containerd configuration marker
+  ansible.builtin.command:
+    argv:
+      - grep
+      - -F
+      - "# Managed by homeServer-ansible"
+      - /etc/containerd/config.toml
+  register: containerd_config_marker
+  changed_when: false
+  failed_when: false
+  when: containerd_config_file.stat.exists
+
+- name: Refuse to overwrite an unmanaged containerd configuration
+  ansible.builtin.assert:
+    that:
+      - containerd_config_marker.rc == 0
+    fail_msg: >-
+      /etc/containerd/config.toml exists without this project's marker. Review
+      its settings manually; the role will not overwrite another configuration.
+  when: containerd_config_file.stat.exists
+
+- name: Install packages needed to retrieve and verify upstream binaries
+  ansible.builtin.apt:
+    name:
+      - ca-certificates
+      - curl
+      - coreutils
+      - libseccomp2
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Download the pinned containerd archive
+  ansible.builtin.get_url:
+    url: "{{ containerd_release_base_url }}/v{{ containerd_version }}/containerd-{{ containerd_version }}-linux-{{ containerd_archive_arch }}.tar.gz"
+    dest: "/var/tmp/containerd-{{ containerd_version }}-linux-{{ containerd_archive_arch }}.tar.gz"
+    mode: "0644"
+    force: false
+
+- name: Download the matching upstream containerd SHA256 manifest
+  ansible.builtin.get_url:
+    url: "{{ containerd_release_base_url }}/v{{ containerd_version }}/containerd-{{ containerd_version }}-linux-{{ containerd_archive_arch }}.tar.gz.sha256sum"
+    dest: "/var/tmp/containerd-{{ containerd_version }}-linux-{{ containerd_archive_arch }}.tar.gz.sha256sum"
+    mode: "0644"
+    force: false
+
+- name: Verify the pinned containerd release archive
+  ansible.builtin.command:
+    argv:
+      - sha256sum
+      - --check
+      - "containerd-{{ containerd_version }}-linux-{{ containerd_archive_arch }}.tar.gz.sha256sum"
+  args:
+    chdir: /var/tmp
+  changed_when: false
+
+- name: Extract containerd into /usr/local
+  ansible.builtin.unarchive:
+    src: "/var/tmp/containerd-{{ containerd_version }}-linux-{{ containerd_archive_arch }}.tar.gz"
+    dest: /usr/local
+    remote_src: true
+    creates: /usr/local/bin/containerd
+  notify: Restart containerd
+
+- name: Install the pinned runc binary with a fixed SHA256 checksum
+  ansible.builtin.get_url:
+    url: "{{ runc_release_base_url }}/v{{ runc_version }}/runc.{{ containerd_archive_arch }}"
+    dest: /usr/local/sbin/runc
+    mode: "0755"
+    checksum: "sha256:{{ runc_binary_sha256_amd64 }}"
+
+- name: Ensure containerd configuration directory exists
+  ansible.builtin.file:
+    path: /etc/containerd
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Create a default containerd configuration when none exists
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/containerd
+      - config
+      - default
+  register: containerd_default_config
+  changed_when: true
+  when: not containerd_config_file.stat.exists
+
+- name: Write the generated default containerd configuration
+  ansible.builtin.copy:
+    dest: /etc/containerd/config.toml
+    owner: root
+    group: root
+    mode: "0644"
+    content: "# Managed by homeServer-ansible\n{{ containerd_default_config.stdout }}"
+  when: not containerd_config_file.stat.exists
+  notify: Restart containerd
+
+- name: Configure the containerd 2.x CRI runtime to use systemd cgroups
+  ansible.builtin.replace:
+    path: /etc/containerd/config.toml
+    regexp: '^ *SystemdCgroup *= *false$'
+    replace: 'SystemdCgroup = true'
+  notify: Restart containerd
+
+- name: Ensure the containerd systemd unit directory exists
+  ansible.builtin.file:
+    path: /usr/local/lib/systemd/system
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install the containerd systemd unit
+  ansible.builtin.template:
+    src: containerd.service.j2
+    dest: /usr/local/lib/systemd/system/containerd.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart containerd
+
+- name: Enable and start containerd
+  ansible.builtin.systemd_service:
+    name: containerd
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: Confirm containerd reports the pinned version
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/containerd
+      - --version
+  register: containerd_version_output
+  changed_when: false
+  failed_when: >-
+    containerd_version_output.rc != 0 or
+    containerd_version not in containerd_version_output.stdout
